@@ -6,7 +6,7 @@ import json
 import datetime
 import math
 
-app = FastAPI(title="NESCO Rajshahi Zone Load Forecast API", version="1.0.0")
+app = FastAPI(title="NESCO Rajshahi Zone Load Forecast API", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -16,7 +16,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Base substation ratings and historical baseline (NESCO only)
+# 16 NESCO Grid Substations metadata & baseline defaults
 NESCO_SUBSTATIONS = [
     {"id": "s1", "name_bn": "রাজশাহী-কাটাখালি", "name_en": "Rajshahi-Katakhali", "circle": "Rajshahi Circle-1", "base_d": 32.5, "base_e": 30.5, "cap": 50},
     {"id": "s2", "name_bn": "রাজশাহী (মিয়াপুর) Switching", "name_en": "Rajshahi (Miapur) Switching", "circle": "Rajshahi Circle-1", "base_d": 76.5, "base_e": 74.8, "cap": 100},
@@ -36,14 +36,65 @@ NESCO_SUBSTATIONS = [
     {"id": "s16", "name_bn": "শাহজাদপুর", "name_en": "Shahjadpur", "circle": "Pabna Circle", "base_d": 0.5, "base_e": 0.5, "cap": 5}
 ]
 
+def get_google_sheet_client():
+    """Initializes gspread client using environment variable or local file"""
+    service_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not service_json:
+        if os.path.exists("service_account.json"):
+            with open("service_account.json") as f:
+                service_json = f.read()
+        else:
+            return None, "GOOGLE_SERVICE_ACCOUNT_JSON is not configured."
+    
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+        info = json.loads(service_json)
+        creds = Credentials.from_service_account_info(
+            info,
+            scopes=[
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive"
+            ]
+        )
+        client = gspread.authorize(creds)
+        return client, None
+    except Exception as e:
+        return None, str(e)
+
 @app.get("/api/health")
 def health():
-    google_configured = bool(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"))
+    """Diagnostic endpoint to verify Google Sheets & Drive credentials on Vercel"""
+    client, err = get_google_sheet_client()
+    sheet_id = os.getenv("SPREADSHEET_ID")
+    folder_id = os.getenv("DRIVE_FOLDER_ID")
+    
+    sheet_status = "Not Connected"
+    sheet_title = None
+    worksheets = []
+    
+    if client and sheet_id:
+        try:
+            sh = client.open_by_key(sheet_id)
+            sheet_title = sh.title
+            worksheets = [ws.title for ws in sh.worksheets()]
+            sheet_status = "Connected & Accessible"
+        except Exception as e:
+            sheet_status = f"Connection Failed: {str(e)}"
+
     return {
         "status": "healthy",
-        "service": "NESCO Load Forecasting Engine",
-        "google_sheets_connected": google_configured,
-        "timestamp": datetime.datetime.utcnow().isoformat()
+        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "environment_variables": {
+            "GOOGLE_SERVICE_ACCOUNT_JSON": "Configured" if client else f"Missing/Invalid ({err})",
+            "SPREADSHEET_ID": sheet_id if sheet_id else "Missing",
+            "DRIVE_FOLDER_ID": folder_id if folder_id else "Missing"
+        },
+        "google_sheet_test": {
+            "connection": sheet_status,
+            "spreadsheet_title": sheet_title,
+            "available_tabs": worksheets
+        }
     }
 
 @app.get("/api/forecast")
@@ -59,17 +110,17 @@ def get_forecast(
     except ValueError:
         t_date = datetime.date(2026, 9, 7)
 
-    dow = t_date.weekday() # 0=Mon, 4=Fri, 5=Sat, 6=Sun
+    dow = t_date.weekday()
 
-    # Day of week multiplier
+    # Day-of-week factor (Friday=4 in Python)
     if day_type == "friday" or (day_type == "auto" and dow == 4):
-        day_mult = 0.90 # Friday Jumma commercial drop
+        day_mult = 0.90
     elif day_type == "saturday" or (day_type == "auto" and dow == 5):
         day_mult = 0.96
     else:
         day_mult = 1.01
 
-    # Weather impact
+    # Weather cooling factor
     rain_drop = 0.0
     if weather == "cloudy":
         rain_drop = -0.02
@@ -90,14 +141,13 @@ def get_forecast(
     elif model == "dow":
         base_day, base_eve = 431.2, 448.9
         mape, rmse = 4.45, 25.10
-    else: # LSTM (default)
+    else:  # LSTM (default)
         base_day, base_eve = 426.5, 445.9
         mape, rmse = 3.73, 21.42
 
     total_fc_day = round(base_day * day_mult * weather_mult, 1)
     total_fc_eve = round(base_eve * day_mult * weather_mult, 1)
 
-    # Substation distribution
     base_sum_d = sum(s["base_d"] for s in NESCO_SUBSTATIONS)
     base_sum_e = sum(s["base_e"] for s in NESCO_SUBSTATIONS)
     scale_d = total_fc_day / base_sum_d
@@ -160,7 +210,6 @@ def save_to_drive(payload: SaveDriveRequest):
     service_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
     folder_id = os.getenv("DRIVE_FOLDER_ID")
 
-    # Generate CSV payload
     csv_rows = ["Substation,Circle,Forecast_Day_Peak_MW,Forecast_Evening_Peak_MW,Capacity_MW,Loading_Pct"]
     for s in payload.substations:
         csv_rows.append(f'"{s.get("name_en")}","{s.get("circle")}",{s.get("forecast_day_peak_mw")},{s.get("forecast_eve_peak_mw")},{s.get("capacity_mw")},{s.get("loading_pct")}')
@@ -194,7 +243,6 @@ def save_to_drive(payload: SaveDriveRequest):
         except Exception as e:
             return {"status": "error", "message": f"Drive API Error: {str(e)}", "csv_content": csv_content}
 
-    # Fallback if service account not yet set in Vercel env
     return {
         "status": "ready_for_download",
         "message": "Google Service Account not set in Vercel env; returning CSV for direct browser download.",
