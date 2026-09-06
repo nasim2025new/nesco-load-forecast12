@@ -791,8 +791,7 @@ async function saveToDriveVercel() {
         });
         const data = await res.json();
         if (data.status === 'success') {
-            alert('Forecast successfully saved to Google Drive!
-File: ' + data.file_url);
+            alert('Forecast successfully saved to Google Drive!\nFile: ' + data.file_url);
         } else if (data.status === 'ready_for_download') {
             exportNescoCSV();
             alert('Downloaded CSV locally (To enable direct cloud saving, set GOOGLE_SERVICE_ACCOUNT_JSON in Vercel settings).');
